@@ -1,0 +1,117 @@
+variables:
+  TZ: "Europe/Moscow"
+
+  ACTION:
+    value: "backup"
+    options: [backup, restore]
+    description: "Что выполняем: backup или restore"
+
+  DATABASE_TYPE:
+    value: "psql"
+    options: [psql, mysql]
+    description: "Тип СУБД"
+
+  DB_HOST:
+    value: ""
+    description: "Хост БД (обязательно)"
+
+  DB_PORT:
+    value: "5432"
+    description: "Порт БД (стандартно для mysql — 3306, для psql - 5432)"
+
+  DB_USER:
+    value: ""
+    description: "Пользователь БД (обязательно)"
+
+  DB_NAME:
+    value: ""
+    description: "Имя базы (обязательно)"
+
+  DB_TEMPLATE:
+    value: ""
+    description: "Название базы для поиска последнего бэкапа (для восстановления)"
+
+  BACKUP_DIR:
+    value: ""
+    description: "Конкретный путь к бэкапу (только восстановление). Пусто → последний по DB_TEMPLATE"
+
+  BACKUP_ROOT:
+    value: "/backups"
+    description: "Корень всех бэкапов"
+
+  BACKUP_SUBDIR:
+    value: "sql"
+    description: "Подкаталог отдела+СУБД (psql или mysql)"
+
+  LOG_ROOT:
+    value: "/backups/logs"
+    description: "Логи отдела"
+
+  SCRIPT_DIR:
+    value: "/scripts"
+    description: "Каталог скриптов на сервере"
+
+  BACKUP_JOBS:
+    value: "8"
+    description: "Параллелизм pg_dump/pg_restore"
+
+.ssh-prepare:
+  before_script:
+    - |
+      : "${SSH_PRIVATE_KEY:?SSH_PRIVATE_KEY is required}"
+      : "${SSH_HOST:?SSH_HOST is required}"
+      : "${SSH_USER:?SSH_USER is required}"
+      apk add --no-cache openssh-client openssl
+      eval "$(ssh-agent -s)"
+      echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+      mkdir -p ~/.ssh && chmod 700 ~/.ssh
+      ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+      chmod 600 ~/.ssh/known_hosts
+      printf "Host *\n\tStrictHostKeyChecking yes\n\tUserKnownHostsFile ~/.ssh/known_hosts\n" > ~/.ssh/config
+      chmod 600 ~/.ssh/config
+
+backup_job:
+  image: alpine:latest
+  tags:
+    - vtblife
+  extends:
+    - .ssh-prepare
+  script:
+    - |
+      BACKUP_PATH="${BACKUP_ROOT}/${BACKUP_SUBDIR}"
+      ssh -o TCPKeepAlive=yes -o ServerAliveCountMax=500 -o ServerAliveInterval=2000 \
+        "$SSH_USER@$SSH_HOST" \
+        "DB_PASSWORD='$DB_PASSWORD' bash ${SCRIPT_DIR}/${DATABASE_TYPE}_backup.sh \
+          '$DB_HOST' '$DB_PORT' '$DB_USER' '$DB_NAME' \
+          '$BACKUP_PATH' '$S3_BUCKET' '$BACKUP_JOBS'"
+  environment:
+    name: db/$DB_NAME
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $ACTION == "backup"
+      when: always
+    - when: never
+
+restore_job:
+  image: alpine:latest
+  tags:
+    - vtblife
+  extends:
+    - .ssh-prepare
+  script:
+    - |
+      BACKUP_PATH="${BACKUP_ROOT}/${BACKUP_SUBDIR}"
+      ssh -o TCPKeepAlive=yes -o ServerAliveCountMax=500 -o ServerAliveInterval=2000 \
+        "$SSH_USER@$SSH_HOST" \
+        "DB_PASSWORD='$DB_PASSWORD' bash ${SCRIPT_DIR}/${DATABASE_TYPE}_restore.sh \
+          '$DB_HOST' '$DB_PORT' '$DB_USER' '$DB_NAME' '$DB_TEMPLATE' \
+          '$BACKUP_PATH' '$BACKUP_DIR' '$BACKUP_JOBS'"
+  environment:
+    name: db/$DB_NAME
+  rules:
+    - if: $ACTION != "restore"
+      when: never
+    - if: $DB_NAME == "" || $DB_HOST == "" || $DB_USER == "" || $DB_PASSWORD == ""
+      when: never
+    - if: $DB_TEMPLATE == "" && $BACKUP_DIR == ""
+      when: never
+    - when: manual
